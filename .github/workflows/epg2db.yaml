@@ -1,0 +1,99 @@
+name: epg2db
+
+on:
+  push:
+    branches:
+      - 'main'
+  repository_dispatch:
+  workflow_dispatch:
+  # schedule:
+  #   - cron: 0 1 */3 * *
+
+env:
+  PY_VER: '3.12'
+  EPG2XML_LOGLEVEL: DEBUG
+
+jobs:
+  epg2db:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - 
+      name: Set up timezone
+      uses: szenius/set-timezone@v2.0
+      with:
+        timezoneLinux: "Asia/Seoul"
+    - 
+      name: Set up Python ${{ env.PY_VER }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ env.PY_VER }}
+    - 
+      name: Install dependencies
+      run: |
+        pip install --upgrade "epg2xml[lxml] @ git+https://github.com/epg2xml/epg2xml.git@main"
+        sudo apt-get install -yqq --no-install-recommends \
+          moreutils
+    - 
+      name: Set up epg2xml.json
+      run: |
+        # 기본 설정파일 생성
+        rm -f epg2xml.json && epg2xml run
+        # 예외 적용 - WAVVE HTTP_PROXY
+        jq --arg U "${{ secrets.HTTP_PROXY }}" \
+          '.WAVVE += {"HTTP_PROXY": $U}' epg2xml.json | sponge epg2xml.json
+        # 예외 적용 - DAUM ID_FORMAT
+        jq --arg ID "{No}.{Source.lower()}" \
+          '.DAUM += {"ID_FORMAT": $ID}' epg2xml.json | sponge epg2xml.json
+        # 채널 업데이트
+        epg2xml update_channels --parallel
+        for p in KT LG SK DAUM NAVER TVING WAVVE SPOTV; do
+          # 모든 채널 추가
+          jq '.'$p'.MY_CHANNELS = "*"' epg2xml.json | sponge epg2xml.json
+          # # 최대 10개의 채널을 무작위 추출
+          # jq -c '.'$p'.CHANNELS[]' Channel.json | shuf -n10 | jq --slurpfile n /dev/stdin \
+          #   '.'$p'.MY_CHANNELS = $n' epg2xml.json | sponge epg2xml.json
+        done
+    - 
+      name: Run epg2xml
+      run: |
+        epg2xml run --dbfile epg.db --parallel
+        echo "TAG_NAME=$(date +"%Y.%m.%d-%H%M%S")" >> $GITHUB_ENV
+        rm epg2xml.json
+    - 
+      name: Push to "download" branch
+      run: |
+        git init
+        git config user.name "${{ github.actor }}"
+        git config user.email "${{ github.actor }}@users.noreply.github.com"
+        git checkout -b download
+        git add .
+        git commit -m "${{ env.TAG_NAME }}"
+        git remote add origin "https://${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
+        git push -f origin download
+    - 
+      name: Releases epg.db
+      uses: softprops/action-gh-release@master
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ env.TAG_NAME }}
+        body: ${{ env.TAG_NAME }}
+        files: |
+          epg.db
+          Channel.json
+    - 
+      name: Cleanup Releases
+      uses: dev-drprasad/delete-older-releases@master
+      with:
+        keep_latest: 2
+        delete_tags: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - 
+      name: Cleanup workflow runs
+      uses: Mattraks/delete-workflow-runs@main
+      with:
+        retain_days: 0
+        keep_minimum_runs: 2
